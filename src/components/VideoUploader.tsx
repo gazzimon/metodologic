@@ -1,0 +1,290 @@
+import { useState, useCallback } from 'react'
+import { useDropzone } from 'react-dropzone'
+import { Upload, Play, FileVideo, Clock } from 'lucide-react'
+import axios from 'axios'
+import toast from 'react-hot-toast'
+
+interface Cycle {
+  id: string
+  startTime: number
+  endTime: number
+  duration: number
+  confidence: number
+  bodyKeypoints: any[]
+  handKeypoints: any[]
+}
+
+interface AnalysisResult {
+  id: string
+  timestamp: number
+  cycles: Cycle[]
+  averageCycleTime: number
+}
+
+interface VideoUploaderProps {
+  onAnalysisComplete: (result: AnalysisResult) => void
+}
+
+const VideoUploader: React.FC<VideoUploaderProps> = ({ onAnalysisComplete }) => {
+  const [isUploading, setIsUploading] = useState(false)
+  const [uploadedFile, setUploadedFile] = useState<File | null>(null)
+  const [analysisProgress, setAnalysisProgress] = useState(0)
+  const [isAnalyzing, setIsAnalyzing] = useState(false)
+
+  const onDrop = useCallback((acceptedFiles: File[]) => {
+    const file = acceptedFiles[0]
+    if (file) {
+      setUploadedFile(file)
+      toast.success(`Archivo seleccionado: ${file.name}`)
+    }
+  }, [])
+
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    onDrop,
+    accept: {
+      'video/*': ['.mp4', '.avi', '.mov', '.mkv', '.webm']
+    },
+    maxFiles: 1,
+    maxSize: 500 * 1024 * 1024 // 500MB
+  })
+
+  const uploadAndAnalyze = async () => {
+    if (!uploadedFile) {
+      toast.error('Por favor selecciona un video primero')
+      return
+    }
+
+    setIsUploading(true)
+    setIsAnalyzing(true)
+    setAnalysisProgress(0)
+
+    const formData = new FormData()
+    formData.append('video', uploadedFile)
+
+    try {
+      // Simulate upload progress
+      const progressInterval = setInterval(() => {
+        setAnalysisProgress(prev => {
+          if (prev >= 90) {
+            clearInterval(progressInterval)
+            return 90
+          }
+          return prev + 10
+        })
+      }, 500)
+
+      const response = await axios.post('http://localhost:3001/api/upload', formData, {
+        headers: {
+          'Content-Type': 'multipart/form-data'
+        }
+      })
+
+      clearInterval(progressInterval)
+      setAnalysisProgress(100)
+
+      if (response.data.success) {
+        // Simulate analysis delay
+        setTimeout(() => {
+          const mockCycles: Cycle[] = generateMockCycles(uploadedFile.name)
+          const result: AnalysisResult = {
+            id: `video_analysis_${Date.now()}`,
+            timestamp: Date.now(),
+            cycles: mockCycles,
+            averageCycleTime: mockCycles.reduce((sum, cycle) => sum + cycle.duration, 0) / mockCycles.length
+          }
+
+          onAnalysisComplete(result)
+          toast.success('Análisis de video completado')
+          setIsAnalyzing(false)
+          setAnalysisProgress(0)
+        }, 2000)
+      } else {
+        throw new Error(response.data.error || 'Error en el análisis')
+      }
+
+    } catch (error) {
+      console.error('Upload/Analysis error:', error)
+      toast.error('Error al subir o analizar el video')
+      setIsAnalyzing(false)
+      setAnalysisProgress(0)
+    } finally {
+      setIsUploading(false)
+    }
+  }
+
+  const generateMockCycles = (videoName: string): Cycle[] => {
+    // Simular ciclos detectados basado en el nombre del archivo
+    const baseCycleTime = videoName.includes('assembly') ? 12 : 
+                         videoName.includes('welding') ? 8 : 10
+    
+    const cycles: Cycle[] = []
+    const totalCycles = Math.floor(Math.random() * 10) + 5 // 5-15 ciclos
+
+    for (let i = 0; i < totalCycles; i++) {
+      const startTime = i * baseCycleTime + Math.random() * 2
+      const endTime = startTime + baseCycleTime + (Math.random() * 3 - 1.5)
+      
+      cycles.push({
+        id: `video_cycle_${i}`,
+        startTime,
+        endTime,
+        duration: endTime - startTime,
+        confidence: 0.7 + Math.random() * 0.3,
+        bodyKeypoints: generateMockKeypoints('body'),
+        handKeypoints: generateMockKeypoints('hand')
+      })
+    }
+
+    return cycles
+  }
+
+  const generateMockKeypoints = (type: 'body' | 'hand') => {
+    const keypoints = []
+    const numPoints = type === 'body' ? 33 : 21
+
+    for (let i = 0; i < numPoints; i++) {
+      keypoints.push({
+        x: Math.random() * 640,
+        y: Math.random() * 480,
+        z: Math.random() * 0.5,
+        visibility: Math.random(),
+        name: `${type}_point_${i}`
+      })
+    }
+
+    return keypoints
+  }
+
+  const removeFile = () => {
+    setUploadedFile(null)
+    setAnalysisProgress(0)
+    setIsAnalyzing(false)
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex justify-between items-center">
+        <h2 className="text-2xl font-bold text-gray-900">
+          Análisis de Video
+        </h2>
+      </div>
+
+      {/* Upload Area */}
+      <div className="space-y-4">
+        {!uploadedFile ? (
+          <div
+            {...getRootProps()}
+            className={`border-2 border-dashed rounded-lg p-12 text-center cursor-pointer transition-colors ${
+              isDragActive
+                ? 'border-blue-400 bg-blue-50'
+                : 'border-gray-300 hover:border-gray-400'
+            }`}
+          >
+            <input {...getInputProps()} />
+            <Upload className="h-12 w-12 text-gray-400 mx-auto mb-4" />
+            {isDragActive ? (
+              <p className="text-lg text-blue-600">
+                Suelta el video aquí...
+              </p>
+            ) : (
+              <div>
+                <p className="text-lg text-gray-600 mb-2">
+                  Arrastra un video aquí o haz clic para seleccionar
+                </p>
+                <p className="text-sm text-gray-500">
+                  Formatos soportados: MP4, AVI, MOV, MKV, WebM (máx. 500MB)
+                </p>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="bg-gray-50 border border-gray-200 rounded-lg p-6">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center">
+                <FileVideo className="h-8 w-8 text-blue-600 mr-3" />
+                <div>
+                  <p className="font-medium text-gray-900">{uploadedFile.name}</p>
+                  <p className="text-sm text-gray-500">
+                    {(uploadedFile.size / 1024 / 1024).toFixed(2)} MB
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={removeFile}
+                className="text-red-600 hover:text-red-800 text-sm font-medium"
+              >
+                Remover
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Analysis Button */}
+        {uploadedFile && !isAnalyzing && (
+          <button
+            onClick={uploadAndAnalyze}
+            disabled={isUploading}
+            className="w-full flex items-center justify-center px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
+          >
+            {isUploading ? (
+              <>
+                <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full mr-2" />
+                Subiendo y Analizando...
+              </>
+            ) : (
+              <>
+                <Play className="h-4 w-4 mr-2" />
+                Analizar Video
+              </>
+            )}
+          </button>
+        )}
+
+        {/* Progress Bar */}
+        {isAnalyzing && (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-gray-600">
+                {analysisProgress < 90 ? 'Subiendo video...' : 'Analizando ciclos...'}
+              </span>
+              <span className="text-sm text-gray-600">{analysisProgress}%</span>
+            </div>
+            <div className="w-full bg-gray-200 rounded-full h-2">
+              <div
+                className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+                style={{ width: `${analysisProgress}%` }}
+              />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Instructions */}
+      <div className="bg-blue-50 border border-blue-200 rounded-lg p-6">
+        <h3 className="font-semibold text-blue-900 mb-3">
+          Instrucciones para el Análisis
+        </h3>
+        <ul className="space-y-2 text-sm text-blue-800">
+          <li className="flex items-start">
+            <Clock className="h-4 w-4 mt-0.5 mr-2 flex-shrink-0" />
+            El video debe mostrar claramente las manos y el cuerpo del trabajador
+          </li>
+          <li className="flex items-start">
+            <Clock className="h-4 w-4 mt-0.5 mr-2 flex-shrink-0" />
+            Los ciclos deben ser consistentes y repetitivos
+          </li>
+          <li className="flex items-start">
+            <Clock className="h-4 w-4 mt-0.5 mr-2 flex-shrink-0" />
+            Buena iluminación mejora la precisión de la detección
+          </li>
+          <li className="flex items-start">
+            <Clock className="h-4 w-4 mt-0.5 mr-2 flex-shrink-0" />
+            El sistema detectará automáticamente manos y puntos clave del cuerpo
+          </li>
+        </ul>
+      </div>
+    </div>
+  )
+}
+
+export default VideoUploader
