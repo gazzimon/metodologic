@@ -11,6 +11,8 @@ interface AnalysisResult {
   timestamp: number
   cycles: Cycle[]
   averageCycleTime: number
+  /** URL del video (blob local o remota) para miniaturas en el editor */
+  videoUrl?: string
 }
 
 interface VideoUploaderProps {
@@ -93,7 +95,9 @@ const VideoUploader: React.FC<VideoUploaderProps> = ({ onAnalysisComplete }) => 
         id: payload.id ?? `video_analysis_${Date.now()}`,
         timestamp: payload.timestamp ?? Date.now(),
         cycles: fixed,
-        averageCycleTime: avg
+        averageCycleTime: avg,
+        // 👇 añadimos el blob URL para que el editor pueda extraer los frames
+        videoUrl: URL.createObjectURL(uploadedFile)
       }
 
       onAnalysisComplete(result)
@@ -157,7 +161,7 @@ const VideoUploader: React.FC<VideoUploaderProps> = ({ onAnalysisComplete }) => 
   return (
     <div className="space-y-6">
       <div className="flex justify-between items-center">
-        <h2 className="text-2xl font-bold text-gray-900">Análisis de Video</h2>
+        <h2 className="text-2lx font-bold text-gray-900">Análisis de Video</h2>
       </div>
 
       {/* Upload Area */}

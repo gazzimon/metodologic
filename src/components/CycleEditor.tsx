@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { Edit2, Save, X, Plus, Trash2, Clock, Users } from 'lucide-react'
 import toast from 'react-hot-toast'
+import CycleThumb from './CycleThumb'
 
 interface Cycle {
   id: string
@@ -17,6 +18,8 @@ interface AnalysisResult {
   timestamp: number
   cycles: Cycle[]
   averageCycleTime: number
+  /** URL del video (blob o http) para extraer el frame en miniaturas */
+  videoUrl?: string
 }
 
 interface CycleEditorProps {
@@ -52,12 +55,9 @@ const CycleEditor: React.FC<CycleEditorProps> = ({ results, onResultsUpdate }) =
       prev.map(cycle => {
         if (cycle.id === cycleId) {
           const updatedCycle = { ...cycle, [field]: value }
-          
-          // Auto-calculate duration if start or end time changes
           if (field === 'startTime' || field === 'endTime') {
             updatedCycle.duration = updatedCycle.endTime - updatedCycle.startTime
           }
-          
           return updatedCycle
         }
         return cycle
@@ -237,6 +237,9 @@ const CycleEditor: React.FC<CycleEditorProps> = ({ results, onResultsUpdate }) =
                     #
                   </th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Miniatura
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                     Tiempo Inicio
                   </th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
@@ -259,6 +262,19 @@ const CycleEditor: React.FC<CycleEditorProps> = ({ results, onResultsUpdate }) =
                     <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
                       {index + 1}
                     </td>
+
+                    {/* Miniatura del fin del ciclo con rig */}
+                    <td className="px-6 py-2 whitespace-nowrap">
+                      <CycleThumb
+                        cycle={cycle}
+                        videoUrl={selectedResult?.videoUrl}
+                        width={120}
+                        height={68}
+                        showHands={true}
+                        showBody={true}
+                      />
+                    </td>
+
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
                       <input
                         type="text"
