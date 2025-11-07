@@ -1,405 +1,487 @@
-import { useState, useRef, useEffect } from 'react'
-import { Camera, Square, Play, Pause, RotateCcw } from 'lucide-react'
-import { Hands } from '@mediapipe/hands'
-import { Camera as MediaPipeCamera } from '@mediapipe/camera_utils'
-import { drawConnectors, drawLandmarks } from '@mediapipe/drawing_utils'
-import toast from 'react-hot-toast'
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Toaster, toast } from "react-hot-toast";
+import { Play, Pause, RotateCcw, Save } from "lucide-react";
 
-interface Cycle {
-  id: string
-  startTime: number
-  endTime: number
-  duration: number
-  confidence: number
-  bodyKeypoints: any[]
-  handKeypoints: any[]
+// MediaPipe
+// Asegúrate de tener instalados:
+//   npm i @mediapipe/hands @mediapipe/camera_utils @mediapipe/drawing_utils
+// y de que Vite resuelva correctamente los assets de mediapipe.
+import "@mediapipe/hands";
+import "@mediapipe/camera_utils";
+import "@mediapipe/drawing_utils";
+
+type Landmark = { x: number; y: number; z: number; visibility?: number };
+type Cycle = {
+  id: string;
+  startTime: number; // segundos
+  endTime: number;   // segundos
+  duration: number;  // end - start
+  confidence?: number;
+  bodyKeypoints?: any[];
+  handKeypoints?: any[];
+};
+
+declare global {
+  // Tipos globales expuestos por los bundles de MediaPipe
+  // (evitamos importar tipos internos no ESM)
+  interface Window {
+    Hands: any;
+    Camera: any;
+    drawConnectors: any;
+    drawLandmarks: any;
+    HAND_CONNECTIONS: any;
+  }
 }
 
-interface AnalysisResult {
-  id: string
-  timestamp: number
-  cycles: Cycle[]
-  averageCycleTime: number
+const cryptoUUID = () =>
+  (globalThis.crypto?.randomUUID?.() ??
+    Math.random().toString(36).slice(2) + Date.now().toString(36)) as string;
+
+// --------- Utilidades de señal / detección de “límite de ciclo” ---------
+
+/**
+ * Métrica de fase: distancia 2D entre la muñeca y la punta del índice (landmark 0 y 8).
+ * Puedes reemplazar esta métrica por otra que represente mejor TU gesto/ritmo.
+ */
+function phaseMetric(handLandmarks: Landmark[]): number {
+  // wrist = 0, index_finger_tip = 8
+  const wrist = handLandmarks[0];
+  const indexTip = handLandmarks[8];
+  if (!wrist || !indexTip) return 0;
+
+  const dx = indexTip.x - wrist.x;
+  const dy = indexTip.y - wrist.y;
+  const dist = Math.hypot(dx, dy);
+
+  // La norma de MediaPipe está en [0..1] relativo al frame.
+  // Devolvemos la distancia como métrica de fase.
+  return dist;
 }
 
-interface RealTimeAnalyzerProps {
-  onAnalysisComplete: (result: AnalysisResult) => void
-  isAnalyzing: boolean
-  setIsAnalyzing: (analyzing: boolean) => void
-}
+/**
+ * Detector con histeresis (alto/bajo). Detecta un “límite de ciclo” cuando
+ * la métrica cruza el umbral ALTO (de estado bajo→alto).
+ * El estado vuelve a “bajo” cuando la métrica cae por debajo de LOW.
+ */
+class BoundaryDetector {
+  private stateHigh = false;
+  private lastBoundarySec: number | null = null;
+  private minDurationSec: number;
+  private onBoundary: (tSec: number) => void;
+  private high: number;
+  private low: number;
 
-const RealTimeAnalyzer: React.FC<RealTimeAnalyzerProps> = ({
-  onAnalysisComplete,
-  isAnalyzing,
-  setIsAnalyzing
-}) => {
-  const videoRef = useRef<HTMLVideoElement>(null)
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const handsRef = useRef<Hands | null>(null)
-  const cameraRef = useRef<MediaPipeCamera | null>(null)
-  
-  const [stream, setStream] = useState<MediaStream | null>(null)
-  const [cycles, setCycles] = useState<Cycle[]>([])
-  const [currentCycle, setCurrentCycle] = useState<Cycle | null>(null)
-  const [cycleStartTime, setCycleStartTime] = useState<number | null>(null)
-
-  // MediaPipe Hands configuration
-  const handsConfig = {
-    staticImageMode: false,
-    maxNumHands: 2,
-    modelComplexity: 1,
-    minDetectionConfidence: 0.5,
-    minTrackingConfidence: 0.5
+  constructor(opts: {
+    high: number;
+    low: number;
+    minDurationSec: number;
+    onBoundary: (tSec: number) => void;
+  }) {
+    if (opts.low >= opts.high) {
+      throw new Error("Histeresis inválida: LOW debe ser < HIGH");
+    }
+    this.high = opts.high;
+    this.low = opts.low;
+    this.minDurationSec = opts.minDurationSec;
+    this.onBoundary = opts.onBoundary;
   }
 
-  const startCamera = async () => {
-    try {
-      const mediaStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 640, height: 480 },
-        audio: false
-      })
-      
-      setStream(mediaStream)
-      
-      if (videoRef.current) {
-        videoRef.current.srcObject = mediaStream
-        videoRef.current.onloadedmetadata = () => {
-          videoRef.current?.play()
-          initializeMediaPipe()
+  setThresholds(high: number, low: number) {
+    if (low >= high) return;
+    this.high = high;
+    this.low = low;
+  }
+
+  setMinDuration(sec: number) {
+    this.minDurationSec = Math.max(0, sec);
+  }
+
+  reset() {
+    this.stateHigh = false;
+    this.lastBoundarySec = null;
+  }
+
+  step(metric: number, tSec: number) {
+    if (!this.stateHigh) {
+      // Estado BAJO -> esperamos cruce por HIGH para generar límite
+      if (metric >= this.high) {
+        // Boundary detectado
+        this.tryBoundary(tSec);
+        this.stateHigh = true;
+      }
+    } else {
+      // Estado ALTO -> esperamos caer por debajo de LOW para “rearmar”
+      if (metric <= this.low) {
+        this.stateHigh = false;
+      }
+    }
+  }
+
+  private tryBoundary(tSec: number) {
+    if (this.lastBoundarySec === null) {
+      this.lastBoundarySec = tSec;
+      this.onBoundary(tSec); // Primer hito (no formará ciclo aún, pero es útil visualizar)
+      return;
+    }
+    const dt = tSec - this.lastBoundarySec;
+    if (dt >= this.minDurationSec) {
+      this.lastBoundarySec = tSec;
+      this.onBoundary(tSec);
+    }
+    // Si dt < minDuration, ignoramos este boundary (ruido).
+  }
+}
+
+// --------- Componente principal ---------
+
+const RealTimeAnalyzer: React.FC<{
+  onAnalysisReady?: (cycles: Cycle[]) => void;
+}> = ({ onAnalysisReady }) => {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const handsRef = useRef<any>(null);
+  const cameraRef = useRef<any>(null);
+  const rafRef = useRef<number | null>(null);
+
+  // Tiempos / resultados
+  const sessionStartRef = useRef<number | null>(null); // performance.now() en ms
+  const [running, setRunning] = useState(false);
+  const [cycles, setCycles] = useState<Cycle[]>([]);
+  const lastBoundarySecRef = useRef<number | null>(null);
+
+  // Parámetros de detección
+  const [high, setHigh] = useState(0.20);        // umbral alto (distancia wrist-index)
+  const [low, setLow] = useState(0.14);          // umbral bajo
+  const [minDur, setMinDur] = useState(0.35);    // duración mínima del ciclo (seg)
+  const [drawSkeleton, setDrawSkeleton] = useState(true);
+
+  // Detector con histeresis
+  const detectorRef = useRef<BoundaryDetector | null>(null);
+  useEffect(() => {
+    detectorRef.current = new BoundaryDetector({
+      high,
+      low,
+      minDurationSec: minDur,
+      onBoundary: (tSec) => {
+        // Cada boundary “cierra” el ciclo anterior y abre el nuevo
+        const prev = lastBoundarySecRef.current;
+        lastBoundarySecRef.current = tSec;
+
+        if (prev !== null) {
+          const start = prev;
+          const end = tSec;
+          const duration = end - start;
+          const cycle: Cycle = {
+            id: cryptoUUID(),
+            startTime: start,
+            endTime: end,
+            duration,
+            confidence: 1, // puedes calcular un score real
+            bodyKeypoints: [],
+            handKeypoints: [],
+          };
+          setCycles((c) => [...c, cycle]);
+        }
+      },
+    });
+
+    return () => {
+      detectorRef.current = null;
+    };
+  }, []); // init
+
+  // Mantener thresholds/duración en el detector
+  useEffect(() => {
+    detectorRef.current?.setThresholds(high, low);
+  }, [high, low]);
+  useEffect(() => {
+    detectorRef.current?.setMinDuration(minDur);
+  }, [minDur]);
+
+  // Inicialización de MediaPipe Hands
+  useEffect(() => {
+    const Hands = (window as any).Hands;
+    const Camera = (window as any).Camera;
+    const drawLandmarks = (window as any).drawLandmarks;
+    const drawConnectors = (window as any).drawConnectors;
+    const HAND_CONNECTIONS = (window as any).HAND_CONNECTIONS;
+
+    if (!Hands || !Camera) {
+      toast.error(
+        "No se cargaron las dependencias de MediaPipe. Revisa @mediapipe/hands y @mediapipe/camera_utils."
+      );
+      return;
+    }
+
+    const videoEl = videoRef.current!;
+    const canvasEl = canvasRef.current!;
+    const ctx = canvasEl.getContext("2d");
+
+    const hands = new Hands({
+      locateFile: (file: string) =>
+        `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+    });
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6,
+    });
+
+    hands.onResults((results: any) => {
+      // Pintar frame
+      if (!ctx) return;
+      canvasEl.width = videoEl.videoWidth;
+      canvasEl.height = videoEl.videoHeight;
+
+      ctx.save();
+      // Espejo horizontal
+      ctx.scale(-1, 1);
+      ctx.translate(-canvasEl.width, 0);
+      ctx.drawImage(results.image, 0, 0, canvasEl.width, canvasEl.height);
+      ctx.restore();
+
+      // Dibujar esqueletos
+      if (drawSkeleton && results.multiHandLandmarks) {
+        for (const landmarks of results.multiHandLandmarks) {
+          drawConnectors(ctx, landmarks, HAND_CONNECTIONS, { lineWidth: 2 });
+          drawLandmarks(ctx, landmarks, { radius: 2 });
         }
       }
-      
-      toast.success('Cámara iniciada correctamente')
-    } catch (error) {
-      console.error('Error accessing camera:', error)
-      toast.error('No se pudo acceder a la cámara')
-    }
-  }
 
-  const stopCamera = () => {
-    if (stream) {
-      stream.getTracks().forEach(track => track.stop())
-      setStream(null)
-    }
-    if (cameraRef.current) {
-      cameraRef.current.stop()
-    }
-  }
+      // Detección de límites (si estamos corriendo)
+      if (running && results.multiHandLandmarks?.length) {
+        const landmarks: Landmark[] = results.multiHandLandmarks[0];
+        const metric = phaseMetric(landmarks);
 
-  const initializeMediaPipe = () => {
-    // Initialize Hands
-    const hands = new Hands(handsConfig)
-    hands.setOptions(handsConfig)
-    
-    hands.onResults((results) => {
-      drawResults(results)
-      detectCycles(results)
-    })
-    
-    handsRef.current = hands
+        // Tiempo relativo en segundos desde el inicio de sesión
+        const nowMs = performance.now();
+        if (sessionStartRef.current === null) {
+          sessionStartRef.current = nowMs;
+        }
+        const tSec = (nowMs - sessionStartRef.current) / 1000;
 
-    // Initialize Camera
-    if (videoRef.current && canvasRef.current) {
-      const camera = new MediaPipeCamera(videoRef.current, {
-        onFrame: async () => {
-          if (videoRef.current && canvasRef.current && handsRef.current) {
-            await handsRef.current.send({ image: videoRef.current })
-          }
-        },
-        width: 640,
-        height: 480
-      })
-      
-      cameraRef.current = camera
-      
-      if (isAnalyzing) {
-        camera.start()
+        detectorRef.current?.step(metric, tSec);
       }
-    }
-  }
+    });
 
-  const drawResults = (results: any) => {
-    if (!canvasRef.current || !videoRef.current) return
+    handsRef.current = hands;
 
-    const canvas = canvasRef.current
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
+    // Cámara
+    const camera = new Camera(videoEl, {
+      onFrame: async () => {
+        await hands.send({ image: videoEl });
+      },
+      width: 1280,
+      height: 720,
+    });
+    cameraRef.current = camera;
 
-    canvas.width = videoRef.current.videoWidth
-    canvas.height = videoRef.current.videoHeight
+    // Autostart cámara
+    camera.start().catch((e: any) => {
+      console.error(e);
+      toast.error("No se pudo iniciar la cámara. Da permisos o elige otro dispositivo.");
+    });
 
-    // Clear canvas
-    ctx.clearRect(0, 0, canvas.width, canvas.height)
-
-    // Draw video frame
-    ctx.save()
-    ctx.scale(-1, 1)
-    ctx.translate(-canvas.width, 0)
-    ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height)
-    ctx.restore()
-
-    // Draw hand landmarks and connections
-    if (results.multiHandLandmarks && results.multiHandedness) {
-      for (let i = 0; i < results.multiHandLandmarks.length; i++) {
-        const landmarks = results.multiHandLandmarks[i]
-        const handedness = results.multiHandedness[i]
-
-        // Draw connections
-        drawConnectors(ctx, landmarks, hands.HAND_CONNECTIONS, {
-          color: handedness.label === 'Left' ? '#00ff00' : '#ff0000',
-          lineWidth: 3
-        })
-
-        // Draw landmarks
-        drawLandmarks(ctx, landmarks, {
-          color: '#00ff00',
-          lineWidth: 2,
-          radius: 3
-        })
-      }
-    }
-  }
-
-  const detectCycles = (results: any) => {
-    const currentTime = Date.now() / 1000
-    
-    // Simple cycle detection logic
-    // A cycle starts when hands are detected after a period of no hands
-    // and ends when hands disappear or change significantly
-    
-    const hasHands = results.multiHandLandmarks && results.multiHandLandmarks.length > 0
-    
-    if (hasHands && !currentCycle) {
-      // Start new cycle
-      const newCycle: Cycle = {
-        id: `cycle_${currentTime}`,
-        startTime: currentTime,
-        endTime: 0,
-        duration: 0,
-        confidence: results.multiHandLandmarks.length > 0 ? 0.8 : 0.3,
-        bodyKeypoints: [], // Add pose detection here
-        handKeypoints: results.multiHandLandmarks[0] || []
-      }
-      setCurrentCycle(newCycle)
-      setCycleStartTime(currentTime)
-      toast.success('Ciclo iniciado')
-    } else if (!hasHands && currentCycle) {
-      // End current cycle
-      const completedCycle: Cycle = {
-        ...currentCycle,
-        endTime: currentTime,
-        duration: currentTime - currentCycle.startTime
-      }
-      
-      setCycles(prev => [...prev, completedCycle])
-      setCurrentCycle(null)
-      setCycleStartTime(null)
-      toast.success(`Ciclo completado: ${completedCycle.duration.toFixed(2)}s`)
-    }
-  }
-
-  const startAnalysis = async () => {
-    setIsAnalyzing(true)
-    if (!stream) {
-      await startCamera()
-    }
-    
-    if (cameraRef.current) {
-      cameraRef.current.start()
-    }
-    
-    toast.success('Análisis en tiempo real iniciado')
-  }
-
-  const stopAnalysis = () => {
-    setIsAnalyzing(false)
-    if (cameraRef.current) {
-      cameraRef.current.stop()
-    }
-    
-    // Complete current cycle if exists
-    if (currentCycle) {
-      const completedCycle: Cycle = {
-        ...currentCycle,
-        endTime: Date.now() / 1000,
-        duration: (Date.now() / 1000) - currentCycle.startTime
-      }
-      setCycles(prev => [...prev, completedCycle])
-      setCurrentCycle(null)
-    }
-    
-    toast.success('Análisis detenido')
-  }
-
-  const resetAnalysis = () => {
-    stopCamera()
-    setCycles([])
-    setCurrentCycle(null)
-    setCycleStartTime(null)
-    setIsAnalyzing(false)
-    toast.success('Análisis reiniciado')
-  }
-
-  const saveAnalysis = () => {
-    if (cycles.length === 0) {
-      toast.error('No hay ciclos para guardar')
-      return
-    }
-
-    const result: AnalysisResult = {
-      id: `analysis_${Date.now()}`,
-      timestamp: Date.now(),
-      cycles: cycles,
-      averageCycleTime: cycles.reduce((sum, cycle) => sum + cycle.duration, 0) / cycles.length
-    }
-
-    onAnalysisComplete(result)
-    toast.success('Análisis guardado correctamente')
-  }
-
-  useEffect(() => {
     return () => {
-      stopCamera()
+      camera.stop();
+      hands.close();
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+  }, [running, drawSkeleton]);
+
+  // Controles
+  const handleStart = () => {
+    if (running) return;
+    // reset estado
+    setCycles([]);
+    sessionStartRef.current = null;
+    lastBoundarySecRef.current = null;
+    detectorRef.current?.reset();
+    setRunning(true);
+    toast.success("Grabando límites de ciclo…");
+  };
+
+  const handlePause = () => {
+    setRunning(false);
+    toast("Pausado");
+  };
+
+  const handleReset = () => {
+    setRunning(false);
+    setCycles([]);
+    sessionStartRef.current = null;
+    lastBoundarySecRef.current = null;
+    detectorRef.current?.reset();
+    toast("Reiniciado");
+  };
+
+  const handleSave = () => {
+    if (!cycles.length) {
+      toast("No hay ciclos aún");
+      return;
     }
-  }, [])
+    onAnalysisReady?.(cycles);
+    toast.success("Ciclos enviados al historial");
+  };
+
+  const totalDuration = useMemo(
+    () => cycles.reduce((acc, c) => acc + c.duration, 0),
+    [cycles]
+  );
+  const avgDuration = useMemo(
+    () => (cycles.length ? totalDuration / cycles.length : 0),
+    [cycles, totalDuration]
+  );
+  const cadence = useMemo(
+    () => (avgDuration > 0 ? 60 / avgDuration : 0), // ciclos por minuto
+    [avgDuration]
+  );
 
   return (
-    <div className="space-y-6">
-      <div className="flex justify-between items-center">
-        <h2 className="text-2xl font-bold text-gray-900">
-          Análisis en Tiempo Real
-        </h2>
-        <div className="flex space-x-2">
-          {!isAnalyzing ? (
-            <button
-              onClick={startAnalysis}
-              className="flex items-center px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 transition-colors"
-            >
-              <Play className="h-4 w-4 mr-2" />
-              Iniciar
-            </button>
-          ) : (
-            <button
-              onClick={stopAnalysis}
-              className="flex items-center px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors"
-            >
-              <Pause className="h-4 w-4 mr-2" />
-              Detener
-            </button>
-          )}
-          
-          <button
-            onClick={resetAnalysis}
-            className="flex items-center px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 transition-colors"
-          >
-            <RotateCcw className="h-4 w-4 mr-2" />
-            Reiniciar
-          </button>
-          
-          <button
-            onClick={saveAnalysis}
-            disabled={cycles.length === 0}
-            className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
-          >
-            Guardar Análisis
-          </button>
-        </div>
-      </div>
+    <div className="w-full h-full p-4 flex flex-col gap-4">
+      <Toaster position="top-right" />
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Video and Canvas */}
-        <div className="space-y-4">
-          <div className="relative bg-black rounded-lg overflow-hidden">
-            <video
-              ref={videoRef}
-              className="w-full h-64 object-cover"
-              autoPlay
-              muted
-              playsInline
-              style={{ transform: 'scaleX(-1)' }}
-            />
-            <canvas
-              ref={canvasRef}
-              className="absolute top-0 left-0 w-full h-full"
-              style={{ transform: 'scaleX(-1)' }}
-            />
-            
-            {!stream && (
-              <div className="absolute inset-0 flex items-center justify-center bg-gray-900 bg-opacity-75">
-                <button
-                  onClick={startCamera}
-                  className="flex items-center px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-                >
-                  <Camera className="h-6 w-6 mr-2" />
-                  Activar Cámara
-                </button>
-              </div>
-            )}
+      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+        {/* Video / Canvas */}
+        <div className="lg:col-span-3 relative rounded-2xl overflow-hidden shadow">
+          <video
+            ref={videoRef}
+            className="hidden"
+            playsInline
+            muted
+          />
+          <canvas
+            ref={canvasRef}
+            className="w-full h-auto bg-black"
+            style={{ aspectRatio: "16/9" }}
+          />
+          <div className="absolute left-3 bottom-3 flex items-center gap-2">
+            <button
+              onClick={running ? handlePause : handleStart}
+              className="px-3 py-2 rounded-2xl shadow bg-white/80 backdrop-blur hover:bg-white"
+              title={running ? "Pausar" : "Iniciar"}
+            >
+              {running ? <Pause size={18} /> : <Play size={18} />}
+            </button>
+            <button
+              onClick={handleReset}
+              className="px-3 py-2 rounded-2xl shadow bg-white/80 backdrop-blur hover:bg-white"
+              title="Reiniciar"
+            >
+              <RotateCcw size={18} />
+            </button>
+            <button
+              onClick={handleSave}
+              className="px-3 py-2 rounded-2xl shadow bg-white/80 backdrop-blur hover:bg-white"
+              title="Guardar ciclos en el historial"
+            >
+              <Save size={18} />
+            </button>
           </div>
-
-          {currentCycle && (
-            <div className="bg-green-50 border border-green-200 rounded-lg p-4">
-              <div className="flex items-center">
-                <Square className="h-5 w-5 text-green-600 mr-2" />
-                <span className="font-medium text-green-800">
-                  Ciclo en progreso...
-                </span>
-              </div>
-              <p className="text-sm text-green-600 mt-1">
-                Iniciado: {currentCycle.startTime.toFixed(2)}s
-              </p>
-            </div>
-          )}
         </div>
 
-        {/* Statistics */}
-        <div className="space-y-4">
-          <h3 className="text-lg font-semibold text-gray-900">
-            Estadísticas del Análisis
-          </h3>
-          
-          <div className="grid grid-cols-2 gap-4">
-            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-              <p className="text-sm text-blue-600">Ciclos Detectados</p>
-              <p className="text-2xl font-bold text-blue-900">{cycles.length}</p>
-            </div>
-            
-            <div className="bg-green-50 border border-green-200 rounded-lg p-4">
-              <p className="text-sm text-green-600">Promedio</p>
-              <p className="text-2xl font-bold text-green-900">
-                {cycles.length > 0 
-                  ? (cycles.reduce((sum, c) => sum + c.duration, 0) / cycles.length).toFixed(2)
-                  : '0.00'
-                }s
-              </p>
-            </div>
-          </div>
+        {/* Panel de control */}
+        <div className="lg:col-span-1 rounded-2xl p-4 border bg-white">
+          <h3 className="font-semibold mb-3">Detección (1 marcador)</h3>
 
-          {cycles.length > 0 && (
-            <div className="space-y-2">
-              <h4 className="font-medium text-gray-900">Últimos Ciclos</h4>
-              <div className="max-h-40 overflow-y-auto space-y-2">
-                {cycles.slice(-5).map((cycle, index) => (
-                  <div
-                    key={cycle.id}
-                    className="bg-gray-50 border border-gray-200 rounded p-3 text-sm"
-                  >
-                    <div className="flex justify-between">
-                      <span>Ciclo {cycles.length - 5 + index + 1}</span>
-                      <span className="font-medium">{cycle.duration.toFixed(2)}s</span>
-                    </div>
-                    <p className="text-gray-500">
-                      {new Date(cycle.startTime * 1000).toLocaleTimeString()}
-                    </p>
-                  </div>
-                ))}
+          <div className="space-y-3">
+            <label className="block text-sm">
+              Umbral alto (HIGH): {high.toFixed(2)}
+              <input
+                type="range"
+                min={0.05}
+                max={0.50}
+                step={0.005}
+                value={high}
+                onChange={(e) => setHigh(parseFloat(e.target.value))}
+                className="w-full"
+              />
+            </label>
+
+            <label className="block text-sm">
+              Umbral bajo (LOW): {low.toFixed(2)}
+              <input
+                type="range"
+                min={0.03}
+                max={0.45}
+                step={0.005}
+                value={low}
+                onChange={(e) => setLow(parseFloat(e.target.value))}
+                className="w-full"
+              />
+            </label>
+
+            <label className="block text-sm">
+              Duración mínima (s): {minDur.toFixed(2)}
+              <input
+                type="range"
+                min={0.10}
+                max={2.00}
+                step={0.01}
+                value={minDur}
+                onChange={(e) => setMinDur(parseFloat(e.target.value))}
+                className="w-full"
+              />
+            </label>
+
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={drawSkeleton}
+                onChange={(e) => setDrawSkeleton(e.target.checked)}
+              />
+              Dibujar esqueleto
+            </label>
+
+            <div className="mt-4 text-sm grid grid-cols-2 gap-2">
+              <div className="p-2 rounded bg-gray-50">
+                <div className="text-gray-500">Ciclos</div>
+                <div className="text-xl font-semibold">{cycles.length}</div>
+              </div>
+              <div className="p-2 rounded bg-gray-50">
+                <div className="text-gray-500">Cadencia (cpm)</div>
+                <div className="text-xl font-semibold">
+                  {cadence.toFixed(1)}
+                </div>
+              </div>
+              <div className="p-2 rounded bg-gray-50 col-span-2">
+                <div className="text-gray-500">Duración promedio (s)</div>
+                <div className="text-xl font-semibold">
+                  {avgDuration.toFixed(2)}
+                </div>
               </div>
             </div>
-          )}
+
+            <hr className="my-3" />
+
+            <div className="max-h-52 overflow-auto text-xs">
+              {cycles.map((c) => (
+                <div key={c.id} className="py-1 flex justify-between">
+                  <span>
+                    {formatTime(c.startTime)} → {formatTime(c.endTime)}
+                  </span>
+                  <span>{c.duration.toFixed(2)}s</span>
+                </div>
+              ))}
+              {!cycles.length && (
+                <div className="text-gray-500">Sin ciclos detectados todavía…</div>
+              )}
+            </div>
+          </div>
         </div>
       </div>
     </div>
-  )
+  );
+};
+
+// --------- Helpers de formato ---------
+
+function formatTime(sec: number) {
+  if (!isFinite(sec) || sec < 0) sec = 0;
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${s.toFixed(2).padStart(5, "0")}`;
 }
 
-export default RealTimeAnalyzer
+export default RealTimeAnalyzer;

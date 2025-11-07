@@ -89,7 +89,16 @@ function App() {
         <div className="bg-white rounded-lg shadow p-6">
           {currentMode === 'realtime' && (
             <RealTimeAnalyzer
-              onAnalysisComplete={(results) => setAnalysisResults(prev => [...prev, results])}
+              onAnalysisReady={(cycles) => {
+                const result = {
+                  id: crypto.randomUUID(),
+                  timestamp: Date.now(),
+                  cycles,
+                  averageCycleTime:
+                    cycles.reduce((a, c) => a + c.duration, 0) / Math.max(1, cycles.length),
+                }
+                setAnalysisResults(prev => [...prev, result])
+              }}
               isAnalyzing={isAnalyzing}
               setIsAnalyzing={setIsAnalyzing}
             />
